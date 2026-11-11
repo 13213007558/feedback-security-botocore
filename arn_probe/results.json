@@ -1,0 +1,188 @@
+[
+  {
+    "case": "plain-bucket",
+    "host": "mybucket.s3.us-west-2.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-same-region",
+    "host": "myap-123456789012.s3-accesspoint.us-west-2.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-cross-region-default",
+    "host": "myap-123456789012.s3-accesspoint.us-west-2.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-cross-region-use-arn-region",
+    "host": "myap-123456789012.s3-accesspoint.us-west-2.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-cross-region-no-arn-region",
+    "error": "UnsupportedS3AccesspointConfigurationError: Unsupported configuration when using S3 access-points: Invalid configuration: region from ARN `us-west-2` does not match client region `us-east-1` and UseArnRegion is `false`"
+  },
+  {
+    "case": "ap-partition-mismatch",
+    "error": "UnsupportedS3AccesspointConfigurationError: Unsupported configuration when using S3 access-points: Client was configured for partition `aws` but ARN (`arn:aws-cn:s3:cn-north-1:123456789012:accesspoint/myap`) has `aws-cn`"
+  },
+  {
+    "case": "ap-cn-partition-ok",
+    "host": "myap-123456789012.s3-accesspoint.cn-north-1.amazonaws.com.cn",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "cn-north-1",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "cn-north-1",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-gov-cross-partition",
+    "error": "UnsupportedS3AccesspointConfigurationError: Unsupported configuration when using S3 access-points: Client was configured for partition `aws` but ARN (`arn:aws-us-gov:s3:us-gov-west-1:123456789012:accesspoint/myap`) has `aws-us-gov`"
+  },
+  {
+    "case": "ap-custom-endpoint",
+    "host": "myap-123456789012.s3.example.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-custom-endpoint-cross-region",
+    "host": "myap-123456789012.s3.example.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-fips-client",
+    "host": "myap-123456789012.s3-accesspoint-fips.us-east-1.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-east-1",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-east-1",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "ap-accelerate",
+    "error": "UnsupportedS3AccesspointConfigurationError: Unsupported configuration when using S3 access-points: Access Points do not support S3 Accelerate"
+  },
+  {
+    "case": "ap-dualstack",
+    "host": "myap-123456789012.s3-accesspoint.dualstack.us-west-2.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "mrap-default",
+    "error": "MissingDependencyException: Missing Dependency: This operation requires an additional dependency. Use pip install botocore[crt] before proceeding."
+  },
+  {
+    "case": "mrap-disabled",
+    "error": "UnsupportedS3AccesspointConfigurationError: Unsupported configuration when using S3 access-points: Invalid configuration: Multi-Region Access Point ARNs are disabled."
+  },
+  {
+    "case": "mrap-partition-mismatch",
+    "error": "UnsupportedS3AccesspointConfigurationError: Unsupported configuration when using S3 access-points: Client was configured for partition `aws-cn` but bucket referred to partition `aws`"
+  },
+  {
+    "case": "mrap-cn-partition-ok",
+    "error": "MissingDependencyException: Missing Dependency: This operation requires an additional dependency. Use pip install botocore[crt] before proceeding."
+  },
+  {
+    "case": "outpost-arn",
+    "host": "myap-123456789012.op-01234567890123456.s3-outposts.us-west-2.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3-outposts",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3-outposts",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  },
+  {
+    "case": "object-lambda-arn",
+    "host": "myolap-123456789012.s3-object-lambda.us-west-2.amazonaws.com",
+    "auth_type": "v4",
+    "signing_ctx": {
+      "region": "us-west-2",
+      "signing_name": "s3-object-lambda",
+      "disableDoubleEncoding": true
+    },
+    "cred_scope_region": "us-west-2",
+    "cred_scope_service": "s3-object-lambda",
+    "region_set_header": null,
+    "scheme": "AWS4-HMAC-SHA256"
+  }
+]
