@@ -34,6 +34,7 @@ from botocore.exceptions import (
     ConfigNotFound,
     ConnectionClosedError,
     ConnectTimeoutError,
+    EndpointConnectionError,
     InvalidDNSNameError,
     InvalidExpressionError,
     InvalidIMDSEndpointError,
@@ -57,6 +58,7 @@ from botocore.session import Session
 from botocore.utils import (
     ArgumentGenerator,
     ArnParser,
+    BadIMDSRequestError,
     CachedProperty,
     ContainerMetadataFetcher,
     IMDSRegionProvider,
@@ -3327,6 +3329,64 @@ class TestInstanceMetadataFetcher(unittest.TestCase):
         with self.assertRaises(MetadataRetrievalError):
             fetcher.retrieve_iam_role_credentials()
 
+    def assert_no_tokenless_request_sent(self):
+        # Evidence check: no GET without the IMDSv2 token header may have
+        # reached the transport.
+        for call in self._send.call_args_list:
+            request = call[0][0]
+            if request.method == 'GET':
+                self.assertIn(
+                    'x-aws-ec2-metadata-token',
+                    request.headers,
+                    f'tokenless IMDSv1 request sent to {request.url}',
+                )
+
+    def test_v1_disabled_token_failures_never_fall_back(self):
+        token_failures = [
+            lambda: self.add_imds_response(b'', status_code=403),
+            lambda: self.add_imds_response(b'', status_code=405),
+            lambda: self.add_imds_connection_error(
+                ReadTimeoutError(endpoint_url='url')
+            ),
+            lambda: self.add_imds_connection_error(
+                ConnectTimeoutError(endpoint_url='url')
+            ),
+            lambda: self.add_imds_connection_error(
+                EndpointConnectionError(endpoint_url='url')
+            ),
+        ]
+        for queue_failure in token_failures:
+            self._send.reset_mock()
+            self._imds_responses = []
+            queue_failure()
+            config = {'ec2_metadata_v1_disabled': True}
+            fetcher = InstanceMetadataFetcher(num_attempts=1, config=config)
+            with self.assertRaises(MetadataRetrievalError):
+                fetcher.retrieve_iam_role_credentials()
+            self.assert_no_tokenless_request_sent()
+
+    def test_v1_disabled_token_bad_request_no_fallback(self):
+        config = {'ec2_metadata_v1_disabled': True}
+        self.add_imds_response(b'', status_code=400)
+        fetcher = InstanceMetadataFetcher(num_attempts=1, config=config)
+        result = fetcher.retrieve_iam_role_credentials()
+        self.assertEqual(result, {})
+        self.assert_no_tokenless_request_sent()
+
+    def test_v1_disabled_with_custom_endpoint(self):
+        endpoint = 'http://imds-proxy.example.internal:8080'
+        config = {
+            'ec2_metadata_v1_disabled': True,
+            'ec2_metadata_service_endpoint': endpoint,
+        }
+        self.add_imds_response(b'', status_code=404)
+        fetcher = InstanceMetadataFetcher(num_attempts=1, config=config)
+        with self.assertRaises(MetadataRetrievalError):
+            fetcher.retrieve_iam_role_credentials()
+        self.assert_no_tokenless_request_sent()
+        for call in self._send.call_args_list:
+            self.assertTrue(call[0][0].url.startswith(endpoint))
+
     def _get_datetime(self, dt=None, offset=None, offset_func=operator.add):
         if dt is None:
             dt = datetime.datetime.now(datetime.timezone.utc).replace(
@@ -3463,6 +3523,109 @@ class TestInstanceMetadataFetcher(unittest.TestCase):
         assert results['expiry_time'] == bad_datetime
 
 
+class TestInstanceMetadataRegionFetcher(unittest.TestCase):
+    def setUp(self):
+        urllib3_session_send = 'botocore.httpsession.URLLib3Session.send'
+        self._urllib3_patch = mock.patch(urllib3_session_send)
+        self._send = self._urllib3_patch.start()
+        self._imds_responses = []
+        self._send.side_effect = self.get_imds_response
+
+    def tearDown(self):
+        self._urllib3_patch.stop()
+
+    def add_imds_response(self, body, status_code=200):
+        response = botocore.awsrequest.AWSResponse(
+            url='http://169.254.169.254/',
+            status_code=status_code,
+            headers={},
+            raw=RawResponse(body),
+        )
+        self._imds_responses.append(response)
+
+    def add_imds_connection_error(self, exception):
+        self._imds_responses.append(exception)
+
+    def get_imds_response(self, request):
+        response = self._imds_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def assert_no_tokenless_request_sent(self):
+        for call in self._send.call_args_list:
+            request = call[0][0]
+            if request.method == 'GET':
+                self.assertIn(
+                    'x-aws-ec2-metadata-token',
+                    request.headers,
+                    f'tokenless IMDSv1 request sent to {request.url}',
+                )
+
+    def test_token_not_supported_falls_back_to_v1_by_default(self):
+        self.add_imds_response(b'', status_code=404)
+        self.add_imds_response(b'us-mars-2a')
+        fetcher = InstanceMetadataRegionFetcher(num_attempts=1)
+        self.assertEqual(fetcher.retrieve_region(), 'us-mars-2')
+        get_calls = [
+            c for c in self._send.call_args_list if c[0][0].method == 'GET'
+        ]
+        self.assertEqual(len(get_calls), 1)
+        self.assertNotIn(
+            'x-aws-ec2-metadata-token', get_calls[0][0][0].headers
+        )
+
+    def test_v1_disabled_token_failures_never_fall_back(self):
+        token_failures = [
+            lambda: self.add_imds_response(b'', status_code=403),
+            lambda: self.add_imds_response(b'', status_code=404),
+            lambda: self.add_imds_response(b'', status_code=405),
+            lambda: self.add_imds_connection_error(
+                ReadTimeoutError(endpoint_url='url')
+            ),
+            lambda: self.add_imds_connection_error(
+                ConnectTimeoutError(endpoint_url='url')
+            ),
+            lambda: self.add_imds_connection_error(
+                EndpointConnectionError(endpoint_url='url')
+            ),
+        ]
+        for queue_failure in token_failures:
+            self._send.reset_mock()
+            self._imds_responses = []
+            queue_failure()
+            config = {'ec2_metadata_v1_disabled': True}
+            fetcher = InstanceMetadataRegionFetcher(
+                num_attempts=1, config=config
+            )
+            with self.assertRaises(MetadataRetrievalError):
+                fetcher.retrieve_region()
+            self.assert_no_tokenless_request_sent()
+
+    def test_v1_disabled_with_custom_endpoint(self):
+        endpoint = 'http://imds-proxy.example.internal:8080'
+        config = {
+            'ec2_metadata_v1_disabled': True,
+            'ec2_metadata_service_endpoint': endpoint,
+        }
+        self.add_imds_response(b'', status_code=404)
+        fetcher = InstanceMetadataRegionFetcher(num_attempts=1, config=config)
+        with self.assertRaises(MetadataRetrievalError):
+            fetcher.retrieve_region()
+        self.assert_no_tokenless_request_sent()
+        for call in self._send.call_args_list:
+            self.assertTrue(call[0][0].url.startswith(endpoint))
+
+    def test_token_bad_request_raises_without_fallback(self):
+        # A 400 on the token PUT is a client error: it must not fall back
+        # to a tokenless request in either mode.
+        self.add_imds_response(b'', status_code=400)
+        fetcher = InstanceMetadataRegionFetcher(num_attempts=1)
+        with self.assertRaises(BadIMDSRequestError):
+            fetcher.retrieve_region()
+        self.assert_no_tokenless_request_sent()
+
+
 class TestIMDSRegionProvider(unittest.TestCase):
     def setUp(self):
         self.environ = {}
@@ -3580,6 +3743,36 @@ class TestIMDSRegionProvider(unittest.TestCase):
         provider.provide()
         args, _ = send.call_args
         self.assertIn('http://myendpoint/', args[0].url)
+
+    def test_v1_disabled_config_is_wired_into_fetcher(self):
+        session = Session()
+        session.set_config_variable('ec2_metadata_v1_disabled', True)
+        provider = IMDSRegionProvider(session)
+        fetcher = provider._create_fetcher()
+        self.assertTrue(fetcher._imds_v1_disabled)
+
+    def test_v1_disabled_token_failure_raises_without_fallback(self):
+        session = Session()
+        session.set_config_variable('ec2_metadata_v1_disabled', True)
+        response = botocore.awsrequest.AWSResponse(
+            url='http://169.254.169.254/latest/api/token',
+            status_code=404,
+            headers={},
+            raw=RawResponse(b''),
+        )
+        with mock.patch(
+            'botocore.httpsession.URLLib3Session.send'
+        ) as send:
+            send.return_value = response
+            provider = IMDSRegionProvider(session)
+            with self.assertRaises(MetadataRetrievalError):
+                provider.provide()
+        for call in send.call_args_list:
+            request = call[0][0]
+            if request.method == 'GET':
+                self.assertIn(
+                    'x-aws-ec2-metadata-token', request.headers
+                )
 
 
 class TestSSOTokenLoader(unittest.TestCase):

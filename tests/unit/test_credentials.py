@@ -2070,6 +2070,19 @@ class TestCreateCredentialResolver(BaseEnvVar):
         cache = resolver.get_provider('assume-role').cache
         self.assertIs(cache, custom_cache)
 
+    def test_imds_v1_disabled_is_wired_into_fetcher(self):
+        self.config_loader.set_config_variable(
+            'ec2_metadata_v1_disabled', True
+        )
+        resolver = credentials.create_credential_resolver(self.session)
+        fetcher = resolver.get_provider('iam-role')._role_fetcher
+        self.assertTrue(fetcher._imds_v1_disabled)
+
+    def test_imds_v1_disabled_defaults_to_false(self):
+        resolver = credentials.create_credential_resolver(self.session)
+        fetcher = resolver.get_provider('iam-role')._role_fetcher
+        self.assertFalse(fetcher._imds_v1_disabled)
+
 
 class TestCanonicalNameSourceProvider(BaseEnvVar):
     def setUp(self):
