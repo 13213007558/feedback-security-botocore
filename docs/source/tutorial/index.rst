@@ -46,3 +46,38 @@ above::
     # All instances that are in a state of pending.
     reservations = client.describe_instances(
         Filters=[{"Name": "instance-state-name", "Values": ["pending"]}])
+
+Sourcing Credentials From an External Process
+==============================================
+
+A profile can obtain credentials by running an external command through the
+``credential_process`` setting.  Because a misbehaving command could otherwise
+hang forever or emit unbounded output and stall every AWS worker thread,
+botocore runs the command with two limits that apply to the initial load and
+to every later refresh:
+
+* ``credential_process_timeout`` - the maximum number of seconds the command
+  is allowed to run.  The default is 60 seconds.
+* ``credential_process_max_output_size`` - the maximum number of bytes the
+  command may write to stdout.  The default is 65536 bytes (64 KB).
+
+If the command exceeds either limit, exits with a non-zero status, or returns
+invalid JSON, botocore terminates the process and raises a
+``CredentialRetrievalError``.  The command's stdout and stderr are not
+included in the error because they can contain secrets; the message only
+describes the failure mode (for example ``credential process timed out after
+60 seconds``).
+
+The command is always executed as an argument list without a shell.  A slow
+but legitimate provider can be accommodated by raising the limits in the
+shared config file::
+
+    [profile my-profile]
+    credential_process = /opt/bin/my-credential-provider
+    credential_process_timeout = 120
+    credential_process_max_output_size = 131072
+
+The same settings can be supplied with the ``AWS_CREDENTIAL_PROCESS_TIMEOUT``
+and ``AWS_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE`` environment variables.  Both
+values must be positive integers; a value of zero or a negative number raises
+an ``InvalidConfigError``.

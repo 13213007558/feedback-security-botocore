@@ -12,6 +12,7 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 import base64
+import io
 import logging
 import os
 import shutil
@@ -3555,14 +3556,20 @@ class TestProcessProvider(BaseEnvVar):
         super().setUp()
         self.loaded_config = {}
         self.load_config = mock.Mock(return_value=self.loaded_config)
-        self.invoked_process = mock.Mock()
+        self.invoked_process = mock.Mock(spec=subprocess.Popen)
         self.popen_mock = mock.Mock(
             return_value=self.invoked_process, spec=subprocess.Popen
         )
 
-    def create_process_provider(self, profile_name='default'):
+    def create_process_provider(
+        self, profile_name='default', timeout=None, max_output_size=None
+    ):
         provider = ProcessProvider(
-            profile_name, self.load_config, popen=self.popen_mock
+            profile_name,
+            self.load_config,
+            popen=self.popen_mock,
+            timeout=timeout,
+            max_output_size=max_output_size,
         )
         return provider
 
@@ -3570,9 +3577,12 @@ class TestProcessProvider(BaseEnvVar):
         return json.dumps(stdout).encode('utf-8'), stderr.encode('utf-8')
 
     def _set_process_return_value(self, stdout, stderr='', rc=0):
-        output = self._get_output(stdout, stderr)
-        self.invoked_process.communicate.return_value = output
+        output, error_output = self._get_output(stdout, stderr)
+        self.invoked_process.stdout = io.BytesIO(output)
+        self.invoked_process.stderr = io.BytesIO(error_output)
         self.invoked_process.returncode = rc
+        self.invoked_process.poll.return_value = rc
+        self.invoked_process.wait.return_value = rc
 
     def test_process_not_invoked_if_profile_does_not_exist(self):
         # self.loaded_config is an empty dictionary with no profile
@@ -3646,7 +3656,7 @@ class TestProcessProvider(BaseEnvVar):
         self.loaded_config['profiles'] = {
             'default': {'credential_process': 'my-process'}
         }
-        old_creds = self._get_output(
+        old_creds, old_stderr = self._get_output(
             {
                 'Version': 1,
                 'AccessKeyId': 'foo',
@@ -3655,7 +3665,7 @@ class TestProcessProvider(BaseEnvVar):
                 'Expiration': expired_date,
             }
         )
-        new_creds = self._get_output(
+        new_creds, new_stderr = self._get_output(
             {
                 'Version': 1,
                 'AccessKeyId': 'foo2',
@@ -3664,8 +3674,22 @@ class TestProcessProvider(BaseEnvVar):
                 'Expiration': future_date,
             }
         )
-        self.invoked_process.communicate.side_effect = [old_creds, new_creds]
-        self.invoked_process.returncode = 0
+        self.popen_mock.side_effect = [
+            mock.Mock(
+                stdout=io.BytesIO(old_creds),
+                stderr=io.BytesIO(old_stderr),
+                returncode=0,
+                poll=mock.Mock(return_value=0),
+                wait=mock.Mock(return_value=0),
+            ),
+            mock.Mock(
+                stdout=io.BytesIO(new_creds),
+                stderr=io.BytesIO(new_stderr),
+                returncode=0,
+                poll=mock.Mock(return_value=0),
+                wait=mock.Mock(return_value=0),
+            ),
+        ]
 
         provider = self.create_process_provider()
         creds = provider.load()
@@ -3683,8 +3707,16 @@ class TestProcessProvider(BaseEnvVar):
 
         provider = self.create_process_provider()
         exception = botocore.exceptions.CredentialRetrievalError
-        with self.assertRaisesRegex(exception, 'Error Message'):
+        # Simulate the child still being alive when the failure is detected
+        # so that the provider is forced to reap it.
+        self.invoked_process.poll.return_value = None
+        with self.assertRaises(exception) as ctx:
             provider.load()
+        # The failing child process must always be cleaned up and the raw
+        # stderr message must not leak into the raised error.
+        self.invoked_process.terminate.assert_called_once_with()
+        self.invoked_process.wait.assert_called()
+        self.assertNotIn('Error Message', str(ctx.exception))
 
     def test_unsupported_version_raises_mismatch(self):
         self.loaded_config['profiles'] = {
@@ -3878,11 +3910,192 @@ class TestProcessProvider(BaseEnvVar):
         self.assertEqual(creds.method, 'custom-process')
         self.assertEqual(creds.account_id, '123456789012')
 
+    _POLL_UNSET = object()
+
+    def _configure_popen(
+        self, stdout, stderr=b'', returncode=0, poll=_POLL_UNSET
+    ):
+        process = mock.Mock(spec=subprocess.Popen)
+        process.stdout = stdout
+        process.stderr = stderr if stderr is not None else io.BytesIO(b'')
+        process.returncode = returncode
+        process.poll = mock.Mock(
+            return_value=(
+                returncode if poll is self._POLL_UNSET else poll
+            )
+        )
+        process.wait = mock.Mock(return_value=returncode)
+        self.popen_mock.return_value = process
+        return process
+
+    def test_timeout_terminates_process(self):
+        self.loaded_config['profiles'] = {
+            'default': {'credential_process': 'my-process'}
+        }
+        # A real pipe with an open write end blocks the reader thread until
+        # the runner's timeout cleanup makes it non-blocking and closes the
+        # write end, mirroring what happens to a stuck child process.
+        read_end, write_end = os.pipe()
+        process = self._configure_popen(
+            os.fdopen(read_end, 'rb', closefd=True),
+            io.BytesIO(b''),
+            poll=None,
+        )
+        original_set_blocking = os.set_blocking
+
+        def set_blocking(fd, blocking):
+            original_set_blocking(fd, blocking)
+            os.close(write_end)
+
+        with mock.patch('os.set_blocking', side_effect=set_blocking):
+            provider = self.create_process_provider(timeout=0.1)
+            start = time.monotonic()
+            with self.assertRaises(
+                botocore.exceptions.CredentialRetrievalError
+            ) as ctx:
+                provider.load()
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 5)
+        self.assertIn('timed out after 0.1 seconds', str(ctx.exception))
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called()
+
+    def test_oversized_output_terminates_process(self):
+        self.loaded_config['profiles'] = {
+            'default': {'credential_process': 'my-process'}
+        }
+        process = self._configure_popen(
+            io.BytesIO(b'x' * 1024), io.BytesIO(b''), poll=None
+        )
+        provider = self.create_process_provider(max_output_size=16)
+        with self.assertRaises(
+            botocore.exceptions.CredentialRetrievalError
+        ) as ctx:
+            provider.load()
+        self.assertIn(
+            'maximum output size of 16 bytes', str(ctx.exception)
+        )
+        process.terminate.assert_called_once_with()
+
+    def test_invalid_json_raises_recognizable_error(self):
+        self.loaded_config['profiles'] = {
+            'default': {'credential_process': 'my-process'}
+        }
+        self._configure_popen(
+            io.BytesIO(b'not-json'), io.BytesIO(b'secret-stderr')
+        )
+        provider = self.create_process_provider()
+        with self.assertRaises(
+            botocore.exceptions.CredentialRetrievalError
+        ) as ctx:
+            provider.load()
+        message = str(ctx.exception)
+        self.assertIn('invalid JSON output', message)
+        self.assertNotIn('not-json', message)
+        self.assertNotIn('secret-stderr', message)
+
+    def test_non_zero_rc_does_not_leak_stderr(self):
+        self.loaded_config['profiles'] = {
+            'default': {'credential_process': 'my-process'}
+        }
+        secret = 'AKIASECRETACCESSKEY123'
+        self._configure_popen(
+            io.BytesIO(b''),
+            io.BytesIO(secret.encode('utf-8')),
+            returncode=42,
+        )
+        provider = self.create_process_provider()
+        with self.assertRaises(
+            botocore.exceptions.CredentialRetrievalError
+        ) as ctx:
+            provider.load()
+        message = str(ctx.exception)
+        self.assertIn('non-zero exit code 42', message)
+        self.assertNotIn(secret, message)
+
+    def test_stderr_written_concurrently_does_not_deadlock(self):
+        self.loaded_config['profiles'] = {
+            'default': {'credential_process': 'my-process'}
+        }
+        payload, _ = self._get_output(
+            {
+                'Version': 1,
+                'AccessKeyId': 'foo',
+                'SecretAccessKey': 'bar',
+            }
+        )
+        # A stderr payload larger than a typical OS pipe buffer would block
+        # a process whose stderr is never drained concurrently.
+        self._configure_popen(
+            io.BytesIO(payload), io.BytesIO(b'e' * 200000)
+        )
+        provider = self.create_process_provider()
+        creds = provider.load()
+        self.assertEqual(creds.access_key, 'foo')
+
+    def test_command_executed_as_argument_list_without_shell(self):
+        self.loaded_config['profiles'] = {
+            'default': {
+                'credential_process': 'my-process --foo --bar "one two"'
+            }
+        }
+        self._set_process_return_value(
+            {
+                'Version': 1,
+                'AccessKeyId': 'foo',
+                'SecretAccessKey': 'bar',
+            }
+        )
+        provider = self.create_process_provider()
+        provider.load()
+        self.popen_mock.assert_called_with(
+            ['my-process', '--foo', '--bar', 'one two'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_default_limits_are_applied(self):
+        self.loaded_config['profiles'] = {
+            'default': {'credential_process': 'my-process'}
+        }
+        self._set_process_return_value(
+            {
+                'Version': 1,
+                'AccessKeyId': 'foo',
+                'SecretAccessKey': 'bar',
+            }
+        )
+        provider = self.create_process_provider()
+        self.assertEqual(
+            provider._timeout,
+            credentials.DEFAULT_CREDENTIAL_PROCESS_TIMEOUT,
+        )
+        self.assertEqual(
+            provider._max_output_size,
+            credentials.DEFAULT_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE,
+        )
+
+    def test_non_positive_timeout_is_rejected(self):
+        with self.assertRaises(botocore.exceptions.InvalidConfigError):
+            self.create_process_provider(timeout=0)
+
+    def test_non_positive_max_output_size_is_rejected(self):
+        with self.assertRaises(botocore.exceptions.InvalidConfigError):
+            self.create_process_provider(max_output_size=-1)
+
 
 class TestProfileProviderBuilder(unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.mock_session = mock.Mock(spec=Session)
+        self.mock_session.get_config_variable.side_effect = lambda name: {
+            'credential_process_timeout': (
+                credentials.DEFAULT_CREDENTIAL_PROCESS_TIMEOUT
+            ),
+            'credential_process_max_output_size': (
+                credentials.DEFAULT_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE
+            ),
+        }.get(name)
         self.builder = ProfileProviderBuilder(self.mock_session)
 
     def test_profile_provider_builder_order(self):
@@ -3899,6 +4112,18 @@ class TestProfileProviderBuilder(unittest.TestCase):
         zipped_providers = zip(providers, expected_providers)
         for provider, expected_type in zipped_providers:
             self.assertTrue(isinstance(provider, expected_type))
+
+    def test_process_provider_receives_configured_limits(self):
+        self.mock_session.get_config_variable.side_effect = lambda name: {
+            'credential_process_timeout': 15,
+            'credential_process_max_output_size': 4096,
+        }.get(name)
+        providers = self.builder.providers('some-profile')
+        process_provider = next(
+            p for p in providers if isinstance(p, ProcessProvider)
+        )
+        self.assertEqual(process_provider._timeout, 15)
+        self.assertEqual(process_provider._max_output_size, 4096)
 
 
 class TestSSOCredentialFetcher(unittest.TestCase):

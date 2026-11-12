@@ -896,9 +896,32 @@ class TestProcessProvider(unittest.TestCase):
         self.environ = os.environ.copy()
         self.environ_patch = mock.patch('os.environ', self.environ)
         self.environ_patch.start()
+        self.working_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.working_dir)
+        self._original_cwd = os.getcwd()
+        os.chdir(self.working_dir)
+        self.addCleanup(os.chdir, self._original_cwd)
 
     def tearDown(self):
         self.environ_patch.stop()
+
+    def _create_provider(
+        self, arguments='', timeout=None, max_output_size=None
+    ):
+        command = self.credential_process
+        if arguments:
+            command = f'{command} {arguments}'
+        load_config = mock.Mock(
+            return_value={
+                'profiles': {'default': {'credential_process': command}}
+            }
+        )
+        return ProcessProvider(
+            'default',
+            load_config,
+            timeout=timeout,
+            max_output_size=max_output_size,
+        )
 
     def test_credential_process(self):
         config = '[profile processcreds]\ncredential_process = %s\n'
@@ -940,6 +963,100 @@ class TestProcessProvider(unittest.TestCase):
             reg = r"(?s)^((?!b').)*$"
             with self.assertRaisesRegex(CredentialRetrievalError, reg):
                 session.get_credentials()
+
+    def test_timeout_kills_slow_process(self):
+        provider = self._create_provider('--sleep 30', timeout=0.2)
+        start = time.time()
+        with self.assertRaises(CredentialRetrievalError) as ctx:
+            provider.load()
+        self.assertLess(time.time() - start, 5)
+        self.assertIn('timed out after 0.2 seconds', str(ctx.exception))
+        self._assert_no_lingering_credential_processes()
+
+    def test_slow_but_legitimate_process_succeeds_with_raised_timeout(self):
+        provider = self._create_provider('--sleep 0.5', timeout=10)
+        credentials = provider.load()
+        self.assertEqual(credentials.access_key, 'spam')
+
+    def test_oversized_stdout_is_rejected_and_reaped(self):
+        provider = self._create_provider(
+            '--stdout-bytes 4096', max_output_size=128
+        )
+        with self.assertRaises(CredentialRetrievalError) as ctx:
+            provider.load()
+        self.assertIn(
+            'maximum output size of 128 bytes', str(ctx.exception)
+        )
+        self._assert_no_lingering_credential_processes()
+
+    def test_concurrent_stdout_and_stderr_does_not_deadlock(self):
+        # The child writes a continuous stderr payload from a background
+        # thread while emitting valid JSON on stdout, so both pipes carry
+        # data at the same time and must be drained concurrently.
+        provider = self._create_provider(
+            '--noisy-stderr-bytes 200000',
+            timeout=30,
+            max_output_size=10 * 1024 * 1024,
+        )
+        credentials = provider.load()
+        self.assertEqual(credentials.access_key, 'spam')
+
+    def test_non_zero_exit_does_not_leak_stderr(self):
+        provider = self._create_provider('--raise-error')
+        with self.assertRaises(CredentialRetrievalError) as ctx:
+            provider.load()
+        message = str(ctx.exception)
+        self.assertIn('non-zero exit code', message)
+        self.assertNotIn('Traceback', message)
+        self.assertNotIn('Failed to fetch credentials', message)
+        self._assert_no_lingering_credential_processes()
+
+    def test_invalid_json_is_reported_without_echoing_output(self):
+        provider = self._create_provider('--invalid-json')
+        with self.assertRaises(CredentialRetrievalError) as ctx:
+            provider.load()
+        message = str(ctx.exception)
+        self.assertIn('invalid JSON output', message)
+        self.assertNotIn('this is not json', message)
+        self._assert_no_lingering_credential_processes()
+
+    def test_failed_run_followed_by_successful_run(self):
+        provider = self._create_provider('--fail-then-succeed', timeout=30)
+        with self.assertRaises(CredentialRetrievalError):
+            provider.load()
+        # The provider does not cache the failure; the next invocation
+        # re-runs the command and returns the successful response.
+        credentials = provider.load()
+        self.assertEqual(credentials.access_key, 'spam')
+        self.assertEqual(credentials.secret_key, 'eggs')
+
+    def test_limits_apply_to_refresh_of_expired_credentials(self):
+        # The initial load returns expired credentials quickly; the refresh
+        # callable must run its command through the same bounded runner.
+        provider = self._create_provider('--expiration-past', timeout=0.2)
+        credentials = provider.load()
+        slow_command = f'{self.credential_process} --sleep 30'
+        credentials._refresh_using = (
+            lambda: provider._retrieve_credentials_using(slow_command)
+        )
+        start = time.time()
+        with self.assertRaises(CredentialRetrievalError):
+            credentials.get_frozen_credentials()
+        self.assertLess(time.time() - start, 5)
+        self._assert_no_lingering_credential_processes()
+
+    def _assert_no_lingering_credential_processes(self):
+        # A leaked child would keep its pipes open and prevent load() from
+        # returning at all, so returning within the timeout budget already
+        # proves the process was reaped.  Double check with pgrep when it is
+        # available on the host.
+        pgrep = shutil.which('pgrep')
+        if pgrep is None:
+            return
+        result = os.popen(
+            f'{pgrep} -f credentialprocess.py'
+        ).read().strip()
+        self.assertEqual(result, '')
 
 
 class TestSTSRegional(BaseAssumeRoleTest):

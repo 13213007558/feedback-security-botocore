@@ -215,6 +215,22 @@ BOTOCORE_DEFAUT_SESSION_VARIABLES = {
         None,
         None,
     ),
+    # The maximum amount of time, in seconds, that a credential process
+    # is allowed to run before it is terminated.
+    'credential_process_timeout': (
+        'credential_process_timeout',
+        'AWS_CREDENTIAL_PROCESS_TIMEOUT',
+        60,
+        int,
+    ),
+    # The maximum number of bytes that a credential process is allowed to
+    # write to stdout before it is terminated.
+    'credential_process_max_output_size': (
+        'credential_process_max_output_size',
+        'AWS_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE',
+        65536,
+        int,
+    ),
 }
 # A mapping for the s3 specific configuration vars. These are the configuration
 # vars that typically go in the s3 section of the config file. This mapping

@@ -80,6 +80,14 @@ ReadOnlyCredentials = namedtuple(
 _DEFAULT_MANDATORY_REFRESH_TIMEOUT = 10 * 60  # 10 min
 _DEFAULT_ADVISORY_REFRESH_TIMEOUT = 15 * 60  # 15 min
 
+# Default limits applied to a ``credential_process`` subprocess.  They can
+# be overridden through the shared config file or environment variables so
+# that slow but legitimate providers can be tuned while misbehaving
+# providers are guaranteed to be reaped instead of stalling credential
+# retrieval indefinitely.
+DEFAULT_CREDENTIAL_PROCESS_TIMEOUT = 60  # seconds
+DEFAULT_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE = 64 * 1024  # bytes
+
 
 def create_credential_resolver(session, cache=None, region_name=None):
     """Create a default credential resolver.
@@ -219,6 +227,12 @@ class ProfileProviderBuilder:
         return ProcessProvider(
             profile_name=profile_name,
             load_config=lambda: self._session.full_config,
+            timeout=self._session.get_config_variable(
+                'credential_process_timeout'
+            ),
+            max_output_size=self._session.get_config_variable(
+                'credential_process_max_output_size'
+            ),
         )
 
     def _create_shared_credential_provider(self, profile_name):
@@ -1077,14 +1091,257 @@ class CredentialProvider:
         return found
 
 
+class _PipeReader(threading.Thread):
+    """Drain a pipe in the background with an optional byte budget.
+
+    The thread keeps reading until the pipe is closed by the child process
+    or the configured maximum number of bytes has been collected.  Reading
+    stderr independently of stdout ensures that a process writing to both
+    streams can never deadlock on a full OS pipe buffer.
+    """
+
+    def __init__(self, pipe, max_size=None):
+        super().__init__(daemon=True)
+        self.pipe = pipe
+        self._pipe = pipe
+        self._max_size = max_size
+        self.data = bytearray()
+        self.truncated = False
+
+    def run(self):
+        read = self._pipe.read
+        max_size = self._max_size
+        try:
+            while True:
+                try:
+                    chunk = read(4096)
+                except OSError:
+                    # The pipe can be switched to non-blocking mode by the
+                    # runner while a failure is being handled.
+                    break
+                if not chunk:
+                    break
+                self.data.extend(chunk)
+                if max_size is not None and len(self.data) > max_size:
+                    self.truncated = True
+                    break
+        finally:
+            try:
+                self._pipe.close()
+            except (OSError, ValueError):
+                pass
+
+
+class CredentialProcessRunner:
+    """Run a credential process with timeout and output size limits.
+
+    The runner always executes the command as an argument list without a
+    shell.  The child process is reaped on every failure path (timeout,
+    oversized output, non-zero exit, invalid JSON) and error messages only
+    describe the failure mode; the process stdout/stderr are never surfaced
+    because they may contain secrets.
+    """
+
+    def __init__(
+        self,
+        popen,
+        process_list,
+        timeout=DEFAULT_CREDENTIAL_PROCESS_TIMEOUT,
+        max_output_size=DEFAULT_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE,
+    ):
+        self._popen = popen
+        self._process_list = process_list
+        self._timeout = timeout
+        self._max_output_size = max_output_size
+
+    def run(self):
+        process = self._popen(
+            self._process_list,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        readers = self._start_readers(process)
+        try:
+            stdout = self._wait_for_output(process, readers)
+            if process.returncode != 0:
+                raise CredentialRetrievalError(
+                    provider=ProcessProvider.METHOD,
+                    error_msg=(
+                        f"credential process exited with non-zero exit code "
+                        f"{process.returncode}"
+                    ),
+                )
+        except BaseException:
+            # Reap the child first.  Closing the write end of the pipes when
+            # the process exits is what unblocks the reader threads.
+            self._terminate(process)
+            self._drain_readers(readers)
+            raise
+        try:
+            return botocore.compat.json.loads(stdout.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            raise CredentialRetrievalError(
+                provider=ProcessProvider.METHOD,
+                error_msg=(
+                    "credential process returned invalid JSON output"
+                ),
+            )
+
+    def _start_readers(self, process):
+        readers = [
+            _PipeReader(process.stdout, self._max_output_size),
+            _PipeReader(process.stderr),
+        ]
+        for reader in readers:
+            reader.start()
+        return readers
+
+    def _wait_for_output(self, process, readers):
+        stdout_reader, stderr_reader = readers
+        deadline = time.monotonic() + self._timeout
+        stdout_reader.join(max(0, deadline - time.monotonic()))
+        if stdout_reader.is_alive():
+            raise self._timeout_error()
+        if stdout_reader.truncated:
+            raise CredentialRetrievalError(
+                provider=ProcessProvider.METHOD,
+                error_msg=(
+                    "credential process exceeded the maximum output size "
+                    f"of {self._max_output_size} bytes"
+                ),
+            )
+        # stdout has closed which means the process is finishing; give
+        # stderr a bounded amount of time to drain as well.
+        stderr_reader.join(max(0, deadline - time.monotonic()))
+        if stderr_reader.is_alive():
+            raise self._timeout_error()
+        remaining = max(0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise self._timeout_error()
+        return bytes(stdout_reader.data)
+
+    def _timeout_error(self):
+        return CredentialRetrievalError(
+            provider=ProcessProvider.METHOD,
+            error_msg=(
+                f"credential process timed out after {self._timeout} seconds"
+            ),
+        )
+
+    def _drain_readers(self, readers):
+        for reader in readers:
+            self._make_non_blocking(reader.pipe)
+        for reader in readers:
+            reader.join(5)
+
+    @staticmethod
+    def _make_non_blocking(pipe):
+        fileno = getattr(pipe, 'fileno', None)
+        if fileno is None:
+            return
+        try:
+            fd = fileno()
+        except (OSError, ValueError):
+            # In-memory file objects used in tests do not back onto a real
+            # file descriptor and cannot be reconfigured.
+            return
+        try:
+            if os.get_blocking(fd):
+                os.set_blocking(fd, False)
+        except OSError:
+            return
+
+    def _terminate(self, process):
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "credential process could not be terminated: %s",
+                    self._process_list,
+                )
+
+
 class ProcessProvider(CredentialProvider):
+    """Load credentials from an external ``credential_process`` command.
+
+    The command is always executed as an argument list, never through a
+    shell.  Each invocation - including the initial load and every later
+    refresh - is bounded by two configurable limits:
+
+    * ``credential_process_timeout``: maximum wall-clock time in seconds the
+      process may run.  Defaults to
+      :data:`DEFAULT_CREDENTIAL_PROCESS_TIMEOUT`.
+    * ``credential_process_max_output_size``: maximum number of bytes the
+      process may write to stdout.  Defaults to
+      :data:`DEFAULT_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE`.
+
+    Both can be set in the shared config file or through the
+    ``AWS_CREDENTIAL_PROCESS_TIMEOUT`` and
+    ``AWS_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE`` environment variables.  A
+    slow but legitimate provider can be accommodated by raising the
+    timeout, for example ``credential_process_timeout = 120``.
+
+    A process that times out, writes too much output, exits with a
+    non-zero status or returns invalid JSON is terminated and raises a
+    :class:`~botocore.exceptions.CredentialRetrievalError`.  The process
+    stdout and stderr are never copied into the error message because they
+    may contain secrets.
+    """
+
     METHOD = 'custom-process'
 
-    def __init__(self, profile_name, load_config, popen=subprocess.Popen):
+    def __init__(
+        self,
+        profile_name,
+        load_config,
+        popen=subprocess.Popen,
+        timeout=None,
+        max_output_size=None,
+    ):
         self._profile_name = profile_name
         self._load_config = load_config
         self._loaded_config = None
         self._popen = popen
+        self._timeout = (
+            timeout
+            if timeout is not None
+            else DEFAULT_CREDENTIAL_PROCESS_TIMEOUT
+        )
+        self._max_output_size = (
+            max_output_size
+            if max_output_size is not None
+            else DEFAULT_CREDENTIAL_PROCESS_MAX_OUTPUT_SIZE
+        )
+        if self._timeout <= 0:
+            raise InvalidConfigError(
+                error_msg=(
+                    'The credential_process_timeout config value must be a '
+                    f'positive number of seconds, got: {self._timeout}'
+                )
+            )
+        if self._max_output_size <= 0:
+            raise InvalidConfigError(
+                error_msg=(
+                    'The credential_process_max_output_size config value '
+                    'must be a positive number of bytes, got: '
+                    f'{self._max_output_size}'
+                )
+            )
 
     def load(self):
         credential_process = self._credential_process
@@ -1113,15 +1370,13 @@ class ProcessProvider(CredentialProvider):
         # We're not using shell=True, so we need to pass the
         # command and all arguments as a list.
         process_list = compat_shell_split(credential_process)
-        p = self._popen(
-            process_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        runner = CredentialProcessRunner(
+            popen=self._popen,
+            process_list=process_list,
+            timeout=self._timeout,
+            max_output_size=self._max_output_size,
         )
-        stdout, stderr = p.communicate()
-        if p.returncode != 0:
-            raise CredentialRetrievalError(
-                provider=self.METHOD, error_msg=stderr.decode('utf-8')
-            )
-        parsed = botocore.compat.json.loads(stdout.decode('utf-8'))
+        parsed = runner.run()
         version = parsed.get('Version', '<Version key not provided>')
         if version != 1:
             raise CredentialRetrievalError(
