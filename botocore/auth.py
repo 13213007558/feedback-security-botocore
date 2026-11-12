@@ -275,9 +275,19 @@ class SigV4Auth(BaseSigner):
         if isinstance(params, Mapping):
             params = params.items()
         for key, value in params:
-            key_val_pairs.append(
-                (quote(key, safe='-_.~'), quote(str(value), safe='-_.~'))
-            )
+            encoded_key = quote(key, safe='-_.~')
+            # A list value expands into repeated key/value pairs, matching
+            # how the request preparer (percent_encode_sequence) serializes
+            # it onto the wire. Stringifying the list would sign a different
+            # query string than the one that is actually sent.
+            if isinstance(value, list):
+                values = value
+            else:
+                values = [value]
+            for element in values:
+                key_val_pairs.append(
+                    (encoded_key, quote(str(element), safe='-_.~'))
+                )
         sorted_key_vals = []
         # Sort by the URI-encoded key names, and in the case of
         # repeated keys, then sort by the value.

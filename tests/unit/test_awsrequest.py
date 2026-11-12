@@ -120,7 +120,7 @@ class TestAWSRequest(unittest.TestCase):
     def test_prepared_request_repr(self):
         expected_repr = (
             '<AWSPreparedRequest stream_output=False, method=GET, '
-            'url=http://example.com, headers={}>'
+            'url=http://example.com, headers=HTTPHeaderDict({})>'
         )
         request_repr = repr(self.prepared_request)
         self.assertEqual(request_repr, expected_repr)
@@ -310,6 +310,37 @@ def test_empty_list_tuples_value_error_for_params():
     request = AWSRequest(url='http://example.com/', params=[()])
     with pytest.raises(ValueError):
         request.prepare()
+
+
+def test_prepared_query_uses_percent_encoding_not_quote_plus():
+    # The prepared query must be encoded with the same rules as the SigV4
+    # canonical query string: spaces become %20 (never '+'), '%' is encoded
+    # as %25 and an existing '+' is preserved as %2B.
+    request = AWSRequest(
+        url='http://example.com/', params={'q': 'a+b c%20d'}
+    )
+    prepared_request = request.prepare()
+    assert prepared_request.url == (
+        'http://example.com/?q=a%2Bb%20c%2520d'
+    )
+
+
+def test_prepared_query_expands_list_values():
+    request = AWSRequest(
+        url='http://example.com/', params={'key': ['a', 'b']}
+    )
+    prepared_request = request.prepare()
+    assert prepared_request.url == 'http://example.com/?key=a&key=b'
+
+
+def test_prepared_headers_preserve_repeated_header_names():
+    # Repeated headers must survive preparation so the wire request carries
+    # every value that was folded into the SigV4 canonical header.
+    request = AWSRequest(url='http://example.com/')
+    request.headers['X-Multi'] = 'one'
+    request.headers['X-Multi'] = 'two'
+    prepared_request = request.prepare()
+    assert prepared_request.headers.get_all('x-multi') == ['one', 'two']
 
 
 class TestAWSResponse(unittest.TestCase):

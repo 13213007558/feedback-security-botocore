@@ -16,6 +16,7 @@ import logging
 from collections.abc import Mapping
 
 import urllib3.util
+from urllib3._collections import HTTPHeaderDict
 from urllib3.connection import HTTPConnection, VerifiedHTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
@@ -384,12 +385,22 @@ class AWSRequestPreparer:
                 params_to_encode = list(original.params.items())
             else:
                 params_to_encode = original.params
-            params = urlencode(params_to_encode, doseq=True)
+            # Encode with the same percent-encoding rules the SigV4 signer
+            # uses for the canonical query string (quote, not quote_plus).
+            # Encoding spaces as '+' here would make the prepared request
+            # differ from what was actually signed.
+            params = botocore.utils.percent_encode_sequence(params_to_encode)
             url = delim.join((url, params))
         return url
 
     def _prepare_headers(self, original, prepared_body=None):
-        headers = HeadersDict(original.headers.items())
+        # HTTPHeaderDict preserves headers that share a name. This matters for
+        # SigV4, where every repeated header value is signed as a single
+        # comma-joined canonical header; collapsing them (the HeadersDict
+        # behavior) would make the wire request differ from what was signed.
+        headers = HTTPHeaderDict()
+        for name, value in original.headers.items():
+            headers.add(name, value)
 
         # If the transfer encoding or content length is already set, use that
         if 'Transfer-Encoding' in headers or 'Content-Length' in headers:
